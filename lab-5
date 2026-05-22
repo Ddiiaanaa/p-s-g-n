@@ -1,0 +1,265 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, mixed_precision
+import numpy as np
+import matplotlib.pyplot as plt
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"GPU: {gpus[0].name}")
+    mixed_precision.set_global_policy('mixed_float16')  
+    print(f"Mixed precision: {mixed_precision.global_policy().name}")
+else:
+    print("GPU не знайдено! Увімкніть T4: Середовище виконання → Змінити тип")
+
+BATCH_SIZE = 256    
+EPOCHS     = 50
+AUTOTUNE   = tf.data.AUTOTUNE
+
+print("\nЗавантаження CIFAR-100...")
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar100.load_data()
+
+x_train = x_train.astype('float32') / 255.0
+x_test  = x_test.astype('float32')  / 255.0
+
+y_train_cat = tf.keras.utils.to_categorical(y_train, 100)
+y_test_cat  = tf.keras.utils.to_categorical(y_test,  100)
+
+print(f"Train: {x_train.shape} | Test: {x_test.shape}")
+
+data_augmentation = tf.keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.1),
+    layers.RandomZoom(0.1),
+], name="augmentation")
+
+val_size = int(len(x_train) * 0.1)
+x_val, y_val_cat = x_train[:val_size],  y_train_cat[:val_size]
+x_tr,  y_tr_cat  = x_train[val_size:],  y_train_cat[val_size:]
+
+def make_datasets():
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices((x_tr, y_tr_cat))
+        .shuffle(10_000)
+        .batch(BATCH_SIZE)
+        .map(lambda x, y: (data_augmentation(x, training=True), y),
+             num_parallel_calls=AUTOTUNE)
+        .prefetch(AUTOTUNE)          
+    )
+    val_ds = (
+        tf.data.Dataset.from_tensor_slices((x_val, y_val_cat))
+        .batch(BATCH_SIZE)
+        .prefetch(AUTOTUNE)
+    )
+    return train_ds, val_ds
+
+train_ds, val_ds = make_datasets()
+
+def get_callbacks():
+    return [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy', patience=7,
+            restore_best_weights=True, verbose=1),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_accuracy', factor=0.5,
+            patience=3, min_lr=1e-6, verbose=1),
+    ]
+
+def conv_block(m, filters, pool_type='max', dropout=0.25):
+    """Базовий блок: Conv → BatchNorm → Pool → Dropout"""
+    m.add(layers.Conv2D(filters, (3, 3), padding='same', activation='relu'))
+    m.add(layers.BatchNormalization())
+    if pool_type == 'max':
+        m.add(layers.MaxPooling2D((2, 2)))
+    else:
+        m.add(layers.AveragePooling2D((2, 2)))
+    m.add(layers.Dropout(dropout))
+
+
+def build_model_1():
+    """Config 1 — проста мережа, Adam"""
+    m = models.Sequential([tf.keras.Input(shape=(32, 32, 3))])
+    conv_block(m, 64)
+    conv_block(m, 128)
+    m.add(layers.Flatten())
+    m.add(layers.Dense(256, activation='relu'))
+    m.add(layers.Dropout(0.5))
+    m.add(layers.Dense(100, activation='softmax', dtype='float32'))
+    m.compile(optimizer='adam',
+              loss='categorical_crossentropy', metrics=['accuracy'])
+    return m
+
+def build_model_2():
+    """Config 2 — глибша мережа (3 блоки), RMSprop"""
+    m = models.Sequential([tf.keras.Input(shape=(32, 32, 3))])
+    conv_block(m, 64)
+    conv_block(m, 128)
+    conv_block(m, 256)
+    m.add(layers.Flatten())
+    m.add(layers.Dense(512, activation='relu'))
+    m.add(layers.Dropout(0.5))
+    m.add(layers.Dense(100, activation='softmax', dtype='float32'))
+    m.compile(optimizer='rmsprop',
+              loss='categorical_crossentropy', metrics=['accuracy'])
+    return m
+
+def build_model_3():
+    """Config 3 — AveragePooling замість MaxPooling, Adamax"""
+    m = models.Sequential([tf.keras.Input(shape=(32, 32, 3))])
+    conv_block(m, 128, pool_type='avg')
+    conv_block(m, 256, pool_type='avg')
+    m.add(layers.Flatten())
+    m.add(layers.Dense(256, activation='relu'))
+    m.add(layers.Dropout(0.4))
+    m.add(layers.Dense(100, activation='softmax', dtype='float32'))
+    m.compile(optimizer='adamax',
+              loss='categorical_crossentropy', metrics=['accuracy'])
+    return m
+
+def build_model_4():
+    """Config 4 — подвійні згортки перед кожним пулінгом, Adam lr=0.001"""
+    m = models.Sequential([tf.keras.Input(shape=(32, 32, 3))])
+    m.add(layers.Conv2D(64,  (3, 3), padding='same', activation='relu'))
+    m.add(layers.BatchNormalization())
+    conv_block(m, 64)
+    m.add(layers.Conv2D(128, (3, 3), padding='same', activation='relu'))
+    m.add(layers.BatchNormalization())
+    conv_block(m, 128)
+    m.add(layers.Flatten())
+    m.add(layers.Dense(256, activation='relu'))
+    m.add(layers.Dropout(0.5))
+    m.add(layers.Dense(100, activation='softmax', dtype='float32'))
+    m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+              loss='categorical_crossentropy', metrics=['accuracy'])
+    return m
+
+def build_model_5():
+    """Config 5 — широка мережа, подвійні згортки, Nadam"""
+    m = models.Sequential([tf.keras.Input(shape=(32, 32, 3))])
+    m.add(layers.Conv2D(128, (3, 3), padding='same', activation='relu'))
+    m.add(layers.BatchNormalization())
+    conv_block(m, 128)
+    m.add(layers.Conv2D(256, (3, 3), padding='same', activation='relu'))
+    m.add(layers.BatchNormalization())
+    conv_block(m, 256)
+    m.add(layers.Flatten())
+    m.add(layers.Dense(512, activation='relu'))
+    m.add(layers.Dropout(0.5))
+    m.add(layers.Dense(100, activation='softmax', dtype='float32'))
+    m.compile(optimizer='nadam',
+              loss='categorical_crossentropy', metrics=['accuracy'])
+    return m
+
+configs = [
+    ("Config 1 (Basic, Adam)",       build_model_1),
+    ("Config 2 (Deep, RMSprop)",     build_model_2),
+    ("Config 3 (AvgPool, Adamax)",   build_model_3),
+    ("Config 4 (DoubleConv, Adam)",  build_model_4),
+    ("Config 5 (Wide, Nadam)",       build_model_5),
+]
+
+LAYER_DESCRIPTIONS = {
+    "Config 1 (Basic, Adam)":
+        "Conv2D(64,relu)+BN+MaxPool+Drop(0.25) → "
+        "Conv2D(128,relu)+BN+MaxPool+Drop(0.25) → "
+        "Flatten → Dense(256,relu) → Drop(0.5) → Dense(100,softmax)",
+    "Config 2 (Deep, RMSprop)":
+        "Conv2D(64)+BN+MaxPool+Drop → Conv2D(128)+BN+MaxPool+Drop → "
+        "Conv2D(256)+BN+MaxPool+Drop → "
+        "Flatten → Dense(512,relu) → Drop(0.5) → Dense(100,softmax)",
+    "Config 3 (AvgPool, Adamax)":
+        "Conv2D(128,relu)+BN+AvgPool+Drop(0.25) → "
+        "Conv2D(256,relu)+BN+AvgPool+Drop(0.25) → "
+        "Flatten → Dense(256,relu) → Drop(0.4) → Dense(100,softmax)",
+    "Config 4 (DoubleConv, Adam)":
+        "Conv2D(64)+BN → Conv2D(64)+BN+MaxPool+Drop → "
+        "Conv2D(128)+BN → Conv2D(128)+BN+MaxPool+Drop → "
+        "Flatten → Dense(256,relu) → Drop(0.5) → Dense(100,softmax)",
+    "Config 5 (Wide, Nadam)":
+        "Conv2D(128)+BN → Conv2D(128)+BN+MaxPool+Drop → "
+        "Conv2D(256)+BN → Conv2D(256)+BN+MaxPool+Drop → "
+        "Flatten → Dense(512,relu) → Drop(0.5) → Dense(100,softmax)",
+}
+OPTIMIZERS = {
+    "Config 1 (Basic, Adam)":      "Adam (lr=0.001)",
+    "Config 2 (Deep, RMSprop)":    "RMSprop",
+    "Config 3 (AvgPool, Adamax)":  "Adamax",
+    "Config 4 (DoubleConv, Adam)": "Adam (lr=0.001)",
+    "Config 5 (Wide, Nadam)":      "Nadam",
+}
+
+results = []
+
+for name, builder in configs:
+    print(f"\n{'='*55}\n Навчання: {name}\n{'='*55}")
+    tf.keras.backend.clear_session()
+
+    model = builder()
+
+    history = model.fit(
+        train_ds,
+        epochs=EPOCHS,
+        validation_data=val_ds,
+        callbacks=get_callbacks(),
+        verbose=1
+    )
+
+    test_loss, test_acc = model.evaluate(
+        x_test, y_test_cat, batch_size=BATCH_SIZE, verbose=0)
+    print(f"Точність: {test_acc:.4f}  |  Втрати: {test_loss:.4f}")
+
+    results.append({
+        'name':       name,
+        'test_acc':   test_acc,
+        'test_loss':  test_loss,
+        'history':    history,
+        'epochs_run': len(history.history['loss'])
+    })
+
+best = max(results, key=lambda x: x['test_acc'])
+
+print("\n" + "═"*65)
+print(f"  {'№':<3} {'Назва':<30} {'Епох':>5} {'Втрати':>8} {'Точність':>9}")
+print("─"*65)
+for i, r in enumerate(results, 1):
+    print(f"  {i:<3} {r['name']:<30} {r['epochs_run']:>5} "
+          f"{r['test_loss']:>8.4f} {r['test_acc']:>9.4f}{star}")
+print("═"*65)
+print(f"\n Найкраща: {best['name']}  |  Точність: {best['test_acc']:.4f}")
+
+hist = best['history'].history
+epochs_range = range(1, len(hist['loss']) + 1)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle(f"Найкраща модель: {best['name']}", fontsize=13, fontweight='bold')
+
+ax1.plot(epochs_range, hist['loss'],     label='Навчальна',    linewidth=2)
+ax1.plot(epochs_range, hist['val_loss'], label='Валідаційна',  linewidth=2, linestyle='--')
+ax1.set_title("Функція втрат")
+ax1.set_xlabel('Епоха')
+ax1.set_ylabel('Втрати')
+ax1.legend()
+ax1.grid(alpha=0.3)
+
+ax2.plot(epochs_range, hist['accuracy'],     label='Навчальна',   linewidth=2)
+ax2.plot(epochs_range, hist['val_accuracy'], label='Валідаційна', linewidth=2, linestyle='--')
+ax2.set_title("Точність")
+ax2.set_xlabel('Епоха')
+ax2.set_ylabel('Точність')
+ax2.legend()
+ax2.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('best_model_plots.png', dpi=120, bbox_inches='tight')
+plt.show()
+print("\n Графік збережено: best_model_plots.png")
+
+print("\n ДАНІ ДЛЯ ТАБЛИЦІ 1")
+print("═"*80)
+for i, r in enumerate(results, 1):
+    print(f"\n[{i}] {r['name']}")
+    print(f"    Кількість епох : {r['epochs_run']}")
+    print(f"    Шари           : {LAYER_DESCRIPTIONS[r['name']]}")
+    print(f"    Оптимізатор    : {OPTIMIZERS[r['name']]}")
+    print(f"    Втрати (test)  : {r['test_loss']:.4f}")
+    print(f"    Точність (test): {r['test_acc']:.4f}")
+print()
